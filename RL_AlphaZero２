@@ -1,0 +1,340 @@
+import numpy as np
+import random
+import copy
+import collections
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import StepLR
+import os
+from tqdm import tqdm  # 標準のtqdmを使用
+import math
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
+import imageio
+from scipy.ndimage import uniform_filter1d
+import time
+
+# ===============================================================
+# 0. Global Settings
+# ===============================================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# ===============================================================
+# 1. Othello Game Environment
+# ===============================================================
+class OthelloEnv:
+    def __init__(self): self.board_size = 8; self.reset()
+    def reset(self):
+        self.board = np.zeros((self.board_size, self.board_size), dtype=int)
+        self.board[3, 3] = self.board[4, 4] = 1; self.board[3, 4] = self.board[4, 3] = -1
+        self.current_player = 1; self.done = False
+    def get_legal_moves(self, player):
+        moves = []
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self.is_valid_move(r, c, player): moves.append((r, c))
+        return moves
+    def is_valid_move(self, r, c, player):
+        if self.board[r, c] != 0: return False
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0: continue
+                r_temp, c_temp = r + dr, c + dc; flipped_found = False
+                while 0 <= r_temp < self.board_size and 0 <= c_temp < self.board_size:
+                    if self.board[r_temp, c_temp] == -player:
+                        flipped_found = True; r_temp += dr; c_temp += dc
+                    elif self.board[r_temp, c_temp] == player and flipped_found: return True
+                    else: break
+        return False
+    def step(self, action):
+        if action is None:
+            self.current_player *= -1
+            if not self.get_legal_moves(self.current_player): self.done = True
+            return
+        r, c = action
+        if not self.is_valid_move(r, c, self.current_player):
+            # 不正な手は即座に負けとする
+            self.done = True; return
+        self.board[r, c] = self.current_player; self._flip_stones(r, c, self.current_player)
+        self.current_player *= -1
+        if not self.get_legal_moves(1) and not self.get_legal_moves(-1): self.done = True
+        elif not self.get_legal_moves(self.current_player): self.current_player *= -1
+    def _flip_stones(self, r, c, player):
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0: continue
+                r_temp, c_temp = r + dr, c + dc; stones_to_flip = []
+                while 0 <= r_temp < self.board_size and 0 <= c_temp < self.board_size:
+                    if self.board[r_temp, c_temp] == -player:
+                        stones_to_flip.append((r_temp, c_temp)); r_temp += dr; c_temp += dc
+                    elif self.board[r_temp, c_temp] == player and stones_to_flip:
+                        for fr, fc in stones_to_flip: self.board[fr, fc] = player
+                        break
+                    else: break
+
+# ===============================================================
+# 2. Neural Network
+# ===============================================================
+class ResidualBlock(nn.Module):
+    def __init__(self, num_channels=64):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(num_channels)
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x))); out = self.bn2(self.conv2(out))
+        out += residual; out = F.relu(out)
+        return out
+
+class PolicyValueNetwork(nn.Module):
+    def __init__(self, num_res_blocks=6, num_channels=64):
+        super(PolicyValueNetwork, self).__init__()
+        self.conv_in = nn.Conv2d(3, num_channels, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(num_channels)
+        self.res_blocks = nn.ModuleList([ResidualBlock(num_channels) for _ in range(num_res_blocks)])
+        self.policy_conv = nn.Conv2d(num_channels, 2, kernel_size=1); self.policy_bn = nn.BatchNorm2d(2)
+        self.policy_fc = nn.Linear(2 * 8 * 8, 64)
+        self.value_conv = nn.Conv2d(num_channels, 1, kernel_size=1); self.value_bn = nn.BatchNorm2d(1)
+        self.value_fc1 = nn.Linear(1 * 8 * 8, 256); self.value_fc2 = nn.Linear(256, 1)
+    def forward(self, x):
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        for block in self.res_blocks: x = block(x)
+        p = F.relu(self.policy_bn(self.policy_conv(x))); p = p.view(p.size(0), -1); p = self.policy_fc(p)
+        policy_log_probs = F.log_softmax(p, dim=1)
+        v = F.relu(self.value_bn(self.value_conv(x))); v = v.view(v.size(0), -1)
+        v = F.relu(self.value_fc1(v)); value = torch.tanh(self.value_fc2(v))
+        return policy_log_probs, value
+
+# ===============================================================
+# 3. MCTS
+# ===============================================================
+class Node:
+    def __init__(self, parent=None, prior_p=1.0):
+        self.parent=parent; self.children={}; self.N=0; self.W=0; self.Q=0; self.P=prior_p
+    def expand(self, action_priors):
+        for action, prob in action_priors.items():
+            if action not in self.children: self.children[action] = Node(parent=self, prior_p=prob)
+    def select(self, c_puct):
+        return max(self.children.items(), key=lambda act_node: act_node[1].get_ucb_score(c_puct))
+    def get_ucb_score(self, c_puct):
+        U = c_puct * self.P * math.sqrt(self.parent.N) / (1 + self.N); return self.Q + U
+    def update(self, leaf_value):
+        self.N += 1; self.W += leaf_value; self.Q = self.W / self.N
+    def backpropagate(self, leaf_value):
+        if self.parent: self.parent.backpropagate(-leaf_value)
+        self.update(leaf_value)
+
+class MCTS:
+    def __init__(self, policy_value_fn, c_puct=4.0, n_simulations=100):
+        self.root = Node(); self.policy_value_fn = policy_value_fn
+        self.c_puct = c_puct; self.n_simulations = n_simulations
+    def _playout(self, env):
+        node = self.root
+        while node.children:
+            action, node = node.select(self.c_puct); env.step(action)
+        action_probs, leaf_value = self.policy_value_fn(env)
+        if not env.done:
+            legal_moves = env.get_legal_moves(env.current_player)
+            if legal_moves:
+                action_priors = {move: action_probs[move[0]*8 + move[1]] for move in legal_moves}
+                node.expand(action_priors)
+        node.backpropagate(leaf_value)
+    def get_move_probs(self, env, temp=1.0, add_noise=False):
+        if self.root.N == 0 and add_noise:
+            legal_moves = env.get_legal_moves(env.current_player)
+            if legal_moves:
+                noise = np.random.dirichlet(0.15 * np.ones(len(legal_moves)))
+                action_probs, _ = self.policy_value_fn(env)
+                action_priors = {move: action_probs[move[0]*8 + move[1]] for move in legal_moves}
+                self.root.expand(action_priors)
+                for i, move in enumerate(legal_moves):
+                    if move in self.root.children: self.root.children[move].P = 0.75 * self.root.children[move].P + 0.25 * noise[i]
+        for _ in range(self.n_simulations):
+            env_copy = copy.deepcopy(env); self._playout(env_copy)
+        act_visits = [(act, node.N) for act, node in self.root.children.items()]
+        if not act_visits: return None, None
+        acts, visits = zip(*act_visits)
+        if temp == 0:
+            probs = np.zeros(len(acts)); probs[np.argmax(visits)] = 1.0
+        else:
+            visit_counts = np.power(np.array(visits, dtype=np.float32), 1/temp); probs = visit_counts / visit_counts.sum()
+        return acts, probs
+    def update_with_move(self, last_move):
+        if last_move in self.root.children: self.root = self.root.children[last_move]; self.root.parent = None
+        else: self.root = Node()
+
+# ===============================================================
+# 4. Agent
+# ===============================================================
+class MCTSAgent:
+    def __init__(self, policy_value_net, n_simulations=100, learning=True):
+        self.policy_value_net = policy_value_net
+        self.learning = learning; self.n_simulations = n_simulations
+        self.mcts = None
+    def _encode_board(self, board, current_player):
+        c1 = (board == current_player).astype(np.float32); c2 = (board == -current_player).astype(np.float32)
+        c3 = np.full(board.shape, current_player, dtype=np.float32); return np.stack([c1, c2, c3])
+    def _policy_value_fn(self, env):
+        self.policy_value_net.eval()
+        encoded = self._encode_board(env.board, env.current_player)
+        tensor = torch.tensor(encoded, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            log_probs, value = self.policy_value_net(tensor)
+        return np.exp(log_probs.cpu().numpy()[0]), value.item()
+    def get_action(self, env, temp=1.0, return_prob=False):
+        legal_moves = env.get_legal_moves(env.current_player)
+        if not legal_moves: return (None, np.zeros(64)) if return_prob else None
+        if self.mcts is None: self.reset_mcts()
+        acts, probs = self.mcts.get_move_probs(env, temp=temp, add_noise=self.learning)
+        if acts is None: action = random.choice(legal_moves)
+        else:
+            if self.learning and temp > 0 and probs is not None and np.sum(probs) > 0: action = acts[np.random.choice(len(acts), p=probs)]
+            else: action = acts[np.argmax(probs)]
+        move_probs = np.zeros(64)
+        if acts:
+            for act, prob in zip(acts, probs): move_probs[act[0]*8 + act[1]] = prob
+        return (action, move_probs) if return_prob else action
+    def update_mcts_with_opponent_move(self, action):
+        if self.mcts: self.mcts.update_with_move(action)
+    def reset_mcts(self): self.mcts = MCTS(self._policy_value_fn, n_simulations=self.n_simulations)
+
+# ===============================================================
+# 5. Self-Play and Training Loop
+# ===============================================================
+def run_self_play_game(agent, temp_threshold=20):
+    env = OthelloEnv(); game_data = []; agent.reset_mcts(); move_count = 0
+    while not env.done:
+        temp = 1.0 if move_count < temp_threshold else 1e-2
+        action, pi = agent.get_action(env, temp=temp, return_prob=True)
+        
+        if action: agent.mcts.update_with_move(action)
+        game_data.append([env.board, env.current_player, pi]); env.step(action); move_count += 1
+        
+    winner = np.sign(np.sum(env.board))
+    
+    for i in range(len(game_data)):
+        z = winner * game_data[i][1] if winner != 0 else 0; game_data[i].append(z)
+    return game_data
+
+def evaluate_agents(challenger, champion, n_simulations, num_games=20):
+    challenger.n_simulations = n_simulations; challenger.learning = False
+    champion.n_simulations = n_simulations; champion.learning = False
+    wins = 0
+    # 評価時は標準のtqdmを使用
+    for i in tqdm(range(num_games), desc="Evaluating", leave=False):
+        env = OthelloEnv()
+        p1 = challenger if i % 2 == 0 else champion; p2 = champion if i % 2 == 0 else challenger
+        p1.reset_mcts(); p2.reset_mcts(); agents = {1: p1, -1: p2}
+        while not env.done:
+            agent = agents[env.current_player]; action = agent.get_action(env, temp=0)
+            other_agent = agents[-env.current_player]
+            other_agent.update_mcts_with_opponent_move(action)
+            env.step(action)
+        winner = np.sign(np.sum(env.board))
+        if (winner == 1 and i % 2 == 0) or (winner == -1 and i % 2 != 0): wins += 1
+    return wins / num_games
+
+def train_alphazero(config):
+    challenger_net = PolicyValueNetwork().to(DEVICE)
+    champion_net = PolicyValueNetwork().to(DEVICE)
+    champion_net.load_state_dict(challenger_net.state_dict())
+    torch.save(champion_net.state_dict(), "champion.pth")
+
+    optimizer = optim.Adam(challenger_net.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = StepLR(optimizer, step_size=20, gamma=0.3)
+    replay_buffer = collections.deque(maxlen=20000)
+
+    history = collections.defaultdict(list); start_time = time.time()
+    
+    print("Starting AlphaZero Tournament training...")
+    # 学習ループ全体をtqdmで囲む
+    for iteration in tqdm(range(1, config['num_iterations'] + 1), desc="Total Iterations"):
+        iter_start_time = time.time()
+        
+        self_play_agent = MCTSAgent(policy_value_net=champion_net, n_simulations=config['n_simulations'], learning=True)
+        
+        # 自己対戦の進捗は内側のtqdmで表示
+        for _ in tqdm(range(config['games_per_iter']), desc=f"Iter {iteration} Self-Play", leave=False):
+            game_data = run_self_play_game(self_play_agent)
+            for board, player, pi, z in game_data:
+                state_tensor = torch.tensor(self_play_agent._encode_board(board, player), dtype=torch.float32)
+                pi_tensor = torch.tensor(pi, dtype=torch.float32)
+                z_tensor = torch.tensor([z], dtype=torch.float32)
+                for i in range(4):
+                    rot_s = torch.rot90(state_tensor, i, [1, 2]); rot_p = torch.rot90(pi_tensor.view(8, 8), i).flatten()
+                    replay_buffer.append((rot_s.unsqueeze(0), rot_p, z_tensor))
+                    flip_s = torch.flip(rot_s, [2]); flip_p = torch.flip(rot_p.view(8, 8), [1]).flatten()
+                    replay_buffer.append((flip_s.unsqueeze(0), flip_p, z_tensor))
+
+        if len(replay_buffer) >= config['batch_size']:
+            challenger_net.train()
+            for _ in range(config['epochs_per_iter']):
+                minibatch = random.sample(replay_buffer, config['batch_size'])
+                state_b, pi_b, z_b = zip(*minibatch)
+                state_b = torch.cat(state_b).to(DEVICE); pi_b = torch.stack(pi_b).to(DEVICE); z_b = torch.stack(z_b).to(DEVICE)
+                optimizer.zero_grad()
+                log_pi, v = challenger_net(state_b)
+                loss_v = F.mse_loss(v.view(-1), z_b.view(-1)); loss_p = -torch.mean(torch.sum(pi_b * log_pi, dim=1))
+                total_loss = loss_v + loss_p; total_loss.backward(); optimizer.step()
+            scheduler.step()
+            history['iterations'].append(iteration)
+            history['total_losses'].append(total_loss.item())
+
+        if iteration % config['eval_interval'] == 0:
+            challenger_agent = MCTSAgent(policy_value_net=challenger_net, n_simulations=config['n_simulations_eval'])
+            champion_agent = MCTSAgent(policy_value_net=champion_net, n_simulations=config['n_simulations_eval'])
+            win_rate = evaluate_agents(challenger_agent, champion_agent, config['n_simulations_eval'], config['eval_games'])
+            print(f"\nIter {iteration}: Challenger win rate vs Champion: {win_rate:.2%}")
+            history['eval_iterations'].append(iteration); history['win_rates'].append(win_rate)
+            
+            if win_rate > config['update_threshold']:
+                print("★★★ New champion crowned! ★★★")
+                champion_net.load_state_dict(challenger_net.state_dict())
+                torch.save(champion_net.state_dict(), "champion.pth")
+                torch.save(champion_net.state_dict(), f"champion_iter_{iteration}.pth")
+            else:
+                print("Challenger was not strong enough. Champion remains.")
+                challenger_net.load_state_dict(champion_net.state_dict())
+    
+    total_time = time.time() - start_time
+    print(f"\nTraining complete! Total time: {total_time/3600:.2f} hours")
+    plot_training_history(history)
+    return "champion.pth"
+
+# ===============================================================
+# 6. Visualization & Main Execution
+# ===============================================================
+def plot_training_history(history):
+    if not history['iterations']: print("No training history to plot."); return
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1); plt.plot(history['iterations'], history['total_losses'])
+    plt.title('Training Loss'); plt.xlabel('Iteration'); plt.grid(True)
+    
+    plt.subplot(1, 2, 2); plt.plot(history['eval_iterations'], history['win_rates'], 'o-')
+    plt.axhline(y=0.55, color='r', linestyle='--', label='Update Threshold (55%)')
+    plt.title('Challenger Win Rate vs Champion'); plt.xlabel('Iteration'); plt.ylim(0, 1.05); plt.legend(); plt.grid(True)
+    
+    plt.tight_layout(); plt.savefig('alphazero_training_history.png'); plt.show()
+
+# --- 学習設定 ---
+TRAINING_CONFIG = {
+    'num_iterations': 100,
+    'games_per_iter': 25,
+    'n_simulations': 100,
+    'n_simulations_eval': 200,
+    'batch_size': 256,
+    'epochs_per_iter': 3,
+    'eval_interval': 5,
+    'eval_games': 20,
+    'update_threshold': 0.55,
+}
+
+# --- メイン実行 ---
+# このセルを実行すると学習が開始されます
+final_model_path = train_alphazero(TRAINING_CONFIG)
+print(f"Final champion model saved to: {final_model_path}")
